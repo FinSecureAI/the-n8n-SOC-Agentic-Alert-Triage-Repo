@@ -1,0 +1,424 @@
+{
+  "name": "SOC Agentic Alert Triage to Incident",
+  "nodes": [
+    {
+      "id": "1",
+      "name": "SIEM Alert Inbound",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        260,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "soc/alert-ingest",
+        "responseMode": "onReceived",
+        "responseData": "default",
+        "options": {}
+      }
+    },
+    {
+      "id": "2",
+      "name": "Normalize Alert",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        520,
+        300
+      ],
+      "parameters": {
+        "functionCode": "const alert = item.json;\n\nreturn [\n  {\n    json: {\n      alert_id: alert.alert_id,\n      src_system: alert.source,\n      rule_name: alert.rule_name,\n      severity: alert.severity,\n      ts_utc: alert.timestamp_utc,\n      user: alert.entities?.user_principal_name || null,\n      host: alert.entities?.host || null,\n      src_ip: alert.entities?.source_ip || null,\n      details: alert.details || {},\n      refs: {\n        raw_events_link: alert.details?.raw_events_link || null\n      }\n    }\n  }\n];\n"
+      }
+    },
+    {
+      "id": "3",
+      "name": "Enrich Asset CMDB",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        780,
+        160
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://cmdb.internal/api/assets",
+        "options": {
+          "queryParameters": [
+            {
+              "name": "hostname",
+              "value": "={{$json[\"host\"]}}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "4",
+      "name": "Enrich Identity HR",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        780,
+        300
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "https://hr-api.internal/users",
+        "options": {
+          "queryParameters": [
+            {
+              "name": "upn",
+              "value": "={{$json[\"user\"]}}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "5",
+      "name": "Enrich Threat Intel",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        780,
+        440
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{`https://ti.internal/api/ip/${$json[\"src_ip\"]}`}}",
+        "options": {}
+      }
+    },
+    {
+      "id": "6",
+      "name": "Merge Enrichment",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1040,
+        300
+      ],
+      "parameters": {
+        "functionCode": "const alert = $node[\"Normalize Alert\"].json;\nconst asset = $node[\"Enrich Asset CMDB\"].json;\nconst identity = $node[\"Enrich Identity HR\"].json;\nconst ti = $node[\"Enrich Threat Intel\"].json;\n\nreturn [\n  {\n    json: {\n      alert,\n      context: {\n        asset,\n        identity,\n        threat_intel: ti\n      }\n    }\n  }\n];\n"
+      }
+    },
+    {
+      "id": "7",
+      "name": "Triage Agent LLM",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1,
+      "position": [
+        1300,
+        300
+      ],
+      "parameters": {
+        "resource": "chat",
+        "model": "gpt-4.1-mini",
+        "mode": "chat",
+        "options": {
+          "temperature": 0.1
+        },
+        "systemMessage": "You are a SOC Alert Triage Agent.\n\nYou receive:\n1) A normalized security alert.\n2) Enrichment context (asset info, identity info, threat intel).\n\nYour job is to:\n- Assess whether this alert is likely malicious, benign, or unclear.\n- Recommend whether to:\n  - \"IGNORE\" (benign/known false positive),\n  - \"QUEUE\" (needs manual review),\n  - \"ESCALATE_INCIDENT\" (high priority incident).\n- Assign a priority: P1 (critical), P2 (high), P3 (medium), P4 (low).\n- Provide a short, analyst-friendly rationale.\n\nOutput STRICT JSON ONLY in this schema:\n\n{\n  \"decision\": \"IGNORE\" | \"QUEUE\" | \"ESCALATE_INCIDENT\",\n  \"priority\": \"P1\" | \"P2\" | \"P3\" | \"P4\",\n  \"confidence\": 0.0-1.0,\n  \"rationale\": \"string\",\n  \"recommended_tags\": [\"tag1\", \"tag2\"]\n}\n\nDo not include any extra keys or text.\n",
+        "input": "Alert:\n{{ JSON.stringify($json.alert, null, 2) }}\n\nContext:\n{{ JSON.stringify($json.context, null, 2) }}"
+      }
+    },
+    {
+      "id": "8",
+      "name": "Parse Triage Output",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [
+        1560,
+        300
+      ],
+      "parameters": {
+        "functionCode": "// Assumes the OpenAI node returns the JSON in the 'data' or 'text' field.\nconst raw = item.json;\nlet content = raw.data || raw.text || raw.choices?.[0]?.message?.content || null;\n\nif (typeof content !== 'string') {\n  content = JSON.stringify(raw);\n}\n\nlet triage;\ntry {\n  triage = JSON.parse(content);\n} catch (e) {\n  throw new Error('Triage Agent did not return valid JSON: ' + content);\n}\n\nreturn [{ json: triage }];\n"
+      }
+    },
+    {
+      "id": "9",
+      "name": "Decision Route",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 1,
+      "position": [
+        1820,
+        300
+      ],
+      "parameters": {
+        "value": "={{$json[\"decision\"]}}",
+        "rules": [
+          {
+            "operation": "equal",
+            "value": "ESCALATE_INCIDENT"
+          },
+          {
+            "operation": "equal",
+            "value": "QUEUE"
+          },
+          {
+            "operation": "equal",
+            "value": "IGNORE"
+          }
+        ]
+      }
+    },
+    {
+      "id": "10",
+      "name": "Incident Summary Agent LLM",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1,
+      "position": [
+        2080,
+        120
+      ],
+      "parameters": {
+        "resource": "chat",
+        "model": "gpt-4.1-mini",
+        "mode": "chat",
+        "options": {
+          "temperature": 0.2
+        },
+        "systemMessage": "You are a SOC Incident Documentation Agent.\n\nGiven:\n- The original alert.\n- Enriched context (asset, identity, threat intel).\n- The Triage Agent's decision and rationale.\n\nGenerate a concise incident summary suitable for an incident ticket.\n\nInclude sections:\n1. Short Title (one line).\n2. Summary (2\u20134 sentences).\n3. Indicators (IPs, hostnames, users).\n4. Suspected TTPs (MITRE-style high-level names).\n5. Immediate Recommendations.\n\nOutput JSON with fields:\n{\n  \"title\": \"string\",\n  \"summary\": \"string\",\n  \"indicators\": [\"string\"],\n  \"suspected_ttps\": [\"string\"],\n  \"recommendations\": [\"string\"]\n}\n",
+        "input": "Alert:\n{{ JSON.stringify($node[\"Normalize Alert\"].json, null, 2) }}\n\nContext:\n{{ JSON.stringify($node[\"Merge Enrichment\"].json.context, null, 2) }}\n\nTriage Result:\n{{ JSON.stringify($node[\"Parse Triage Output\"].json, null, 2) }}\n"
+      }
+    },
+    {
+      "id": "11",
+      "name": "Create Incident ServiceNow",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        2340,
+        120
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://servicenow.example.com/api/now/table/incident",
+        "authentication": "none",
+        "jsonBody": "={{ {\"short_description\": $node[\"Incident Summary Agent LLM\"].json[\"title\"], \"description\": \"Summary:\\n\" + $node[\"Incident Summary Agent LLM\"].json[\"summary\"] + \"\\n\\nIndicators:\\n\" + $node[\"Incident Summary Agent LLM\"].json[\"indicators\"].join(', ') + \"\\n\\nSuspected TTPs:\\n\" + $node[\"Incident Summary Agent LLM\"].json[\"suspected_ttps\"].join(', ') + \"\\n\\nRecommendations:\\n- \" + $node[\"Incident Summary Agent LLM\"].json[\"recommendations\"].join('\\n- ') + \"\\n\\nAlert ID: \" + $node[\"Normalize Alert\"].json[\"alert_id\"] + \"\\nSource: \" + $node[\"Normalize Alert\"].json[\"src_system\"] + \"\\nRule: \" + $node[\"Normalize Alert\"].json[\"rule_name\"] + \"\\nSeverity: \" + $node[\"Parse Triage Output\"].json[\"priority\"], \"u_alert_id\": $node[\"Normalize Alert\"].json[\"alert_id\"], \"u_alert_source\": $node[\"Normalize Alert\"].json[\"src_system\"], \"u_user\": $node[\"Normalize Alert\"].json[\"user\"], \"u_host\": $node[\"Normalize Alert\"].json[\"host\"], \"u_priority\": $node[\"Parse Triage Output\"].json[\"priority\"], \"u_triage_confidence\": $node[\"Parse Triage Output\"].json[\"confidence\"], \"u_triage_rationale\": $node[\"Parse Triage Output\"].json[\"rationale\"], \"assignment_group\": \"SOC Tier 2\", \"impact\": \"1\", \"urgency\": \"1\" } }}",
+        "options": {
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "12",
+      "name": "Log Outcome",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        2600,
+        120
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://logging.internal/api/triage-log",
+        "authentication": "none",
+        "jsonBody": "={{ {\"alert_id\": $node[\"Normalize Alert\"].json[\"alert_id\"], \"triage_decision\": $node[\"Parse Triage Output\"].json[\"decision\"], \"triage_priority\": $node[\"Parse Triage Output\"].json[\"priority\"], \"triage_confidence\": $node[\"Parse Triage Output\"].json[\"confidence\"], \"created_at_utc\": $now } }}",
+        "options": {
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "13",
+      "name": "Queue Notification",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        2080,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://chat.internal/api/soc-queue",
+        "authentication": "none",
+        "jsonBody": "={{ {\"text\": \"Queued alert for manual review: \" + $node[\"Normalize Alert\"].json[\"alert_id\"] + \" (\" + $node[\"Normalize Alert\"].json[\"rule_name\"] + \")\", \"severity\": $node[\"Normalize Alert\"].json[\"severity\"], \"decision\": $node[\"Parse Triage Output\"].json[\"decision\"], \"rationale\": $node[\"Parse Triage Output\"].json[\"rationale\"] } }}",
+        "options": {
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "14",
+      "name": "Ignore Logger",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 1,
+      "position": [
+        2080,
+        480
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://logging.internal/api/ignored-alerts",
+        "authentication": "none",
+        "jsonBody": "={{ {\"alert_id\": $node[\"Normalize Alert\"].json[\"alert_id\"], \"reason\": $node[\"Parse Triage Output\"].json[\"rationale\"], \"decision\": $node[\"Parse Triage Output\"].json[\"decision\"], \"created_at_utc\": $now } }}",
+        "options": {
+          "headers": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": {
+    "SIEM Alert Inbound": {
+      "main": [
+        [
+          {
+            "node": "Normalize Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Alert": {
+      "main": [
+        [
+          {
+            "node": "Enrich Asset CMDB",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enrich Asset CMDB": {
+      "main": [
+        [
+          {
+            "node": "Enrich Identity HR",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enrich Identity HR": {
+      "main": [
+        [
+          {
+            "node": "Enrich Threat Intel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Enrich Threat Intel": {
+      "main": [
+        [
+          {
+            "node": "Merge Enrichment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Enrichment": {
+      "main": [
+        [
+          {
+            "node": "Triage Agent LLM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Triage Agent LLM": {
+      "main": [
+        [
+          {
+            "node": "Parse Triage Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Triage Output": {
+      "main": [
+        [
+          {
+            "node": "Decision Route",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decision Route": {
+      "main": [
+        [
+          {
+            "node": "Incident Summary Agent LLM",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Queue Notification",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ignore Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Incident Summary Agent LLM": {
+      "main": [
+        [
+          {
+            "node": "Create Incident ServiceNow",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Incident ServiceNow": {
+      "main": [
+        [
+          {
+            "node": "Log Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {},
+  "id": "soc-agentic-alert-triage-incident",
+  "versionId": "1"
+}
